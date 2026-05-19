@@ -5,8 +5,8 @@ import os
 import io
 import wave
 import time
-import requests
 from discord.ext import commands
+from discord.ext.voice_recv import VoiceRecvClient, BasicSink
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,39 +30,33 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 active_recordings = {}
 
 
-class AudioSink(discord.AudioSink):
-    """Recibe y acumula el audio de todos los speakers."""
+class AudioCollector:
+    """Acumula chunks de audio de todos los speakers."""
 
     def __init__(self):
-        self.audio_data = {}       # {user_id: [chunks]}
+        self.chunks = []
         self.last_audio_time = time.time()
-        self.combined_chunks = []  # audio mezclado
 
-    def write(self, data, user):
+    def add_chunk(self, data: bytes):
+        self.chunks.append(data)
         self.last_audio_time = time.time()
-        if user not in self.audio_data:
-            self.audio_data[user] = []
-        self.audio_data[user].append(data.data)
-        self.combined_chunks.append(data.data)
 
-    def get_audio_bytes(self):
-        """Combina todo el audio en un archivo WAV en memoria."""
-        if not self.combined_chunks:
+    def get_wav_bytes(self):
+        if not self.chunks:
             return None
-
         buffer = io.BytesIO()
         with wave.open(buffer, 'wb') as wf:
-            wf.setnchannels(2)       # stereo
-            wf.setsampwidth(2)       # 16-bit
-            wf.setframerate(48000)   # 48kHz
-            for chunk in self.combined_chunks:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(48000)
+            for chunk in self.chunks:
                 wf.writeframes(chunk)
-
         buffer.seek(0)
         return buffer
 
-    def cleanup(self):
-        pass
+    def reset(self):
+        self.chunks = []
+        self.last_audio_time = time.time()
 
 
 class RecordingSession:
@@ -72,7 +66,7 @@ class RecordingSession:
         self.voice_client = voice_client
         self.channel = channel
         self.text_channel = text_channel
-        self.sink = None
+        self.collector = AudioCollector()
         self.segments = []
         self.is_recording = False
         self.start_time = time.time()
@@ -81,12 +75,13 @@ class RecordingSession:
 
     async def start(self):
         self.is_recording = True
-        self.sink = AudioSink()
-        self.voice_client.start_recording(
-            self.sink,
-            self.on_recording_finished,
-            self.text_channel
-        )
+
+        def audio_callback(user, data):
+            self.collector.add_chunk(bytes(data.data))
+
+        sink = BasicSink(audio_callback)
+        self.voice_client.listen(sink)
+
         await self.text_channel.send("🔴 **Grabación iniciada.** Hablen con normalidad.\nUsá `!stop` para detener manualmente.")
         asyncio.create_task(self.monitor())
 
@@ -106,7 +101,7 @@ class RecordingSession:
                 break
 
             # Verificar silencio prolongado
-            if self.sink and (time.time() - self.sink.last_audio_time) > SILENCE_TIMEOUT:
+            if (time.time() - self.collector.last_audio_time) > SILENCE_TIMEOUT:
                 await self.text_channel.send(f"🔇 {SILENCE_TIMEOUT}s de silencio — deteniendo grabación.")
                 await self.stop()
                 break
@@ -118,37 +113,23 @@ class RecordingSession:
     async def rotate_segment(self):
         """Guarda el segmento actual y empieza uno nuevo."""
         await self.text_channel.send("⏱️ Segmento de 9 minutos completado, iniciando nuevo segmento...")
-
-        # Detener grabacion actual y guardar segmento
-        self.voice_client.stop_recording()
-        await asyncio.sleep(1)
-
-        audio = self.sink.get_audio_bytes()
-        if audio:
-            self.segments.append(audio)
-
-        # Iniciar nuevo segmento
-        self.sink = AudioSink()
+        wav = self.collector.get_wav_bytes()
+        if wav:
+            self.segments.append(wav)
+        self.collector.reset()
         self.segment_start_time = time.time()
-        self.voice_client.start_recording(
-            self.sink,
-            self.on_recording_finished,
-            self.text_channel
-        )
 
     async def stop(self):
         if not self.is_recording:
             return
         self.is_recording = False
-        self.voice_client.stop_recording()
 
-    def on_recording_finished(self, sink, text_channel, *args):
-        """Callback cuando termina la grabación — envía a n8n."""
-        audio = sink.get_audio_bytes()
-        if audio:
-            self.segments.append(audio)
+        wav = self.collector.get_wav_bytes()
+        if wav:
+            self.segments.append(wav)
 
-        asyncio.create_task(self.send_to_n8n())
+        self.voice_client.stop_listening()
+        await self.send_to_n8n()
 
     async def send_to_n8n(self):
         """Envía cada segmento al webhook de n8n."""
@@ -162,6 +143,7 @@ class RecordingSession:
         async with aiohttp.ClientSession() as session:
             for i, audio_segment in enumerate(self.segments):
                 try:
+                    audio_segment.seek(0)
                     form = aiohttp.FormData()
                     form.add_field(
                         'audio',
@@ -215,7 +197,7 @@ async def start_recording(ctx):
     voice_channel = ctx.author.voice.channel
 
     try:
-        voice_client = await voice_channel.connect()
+        voice_client = await voice_channel.connect(cls=VoiceRecvClient)
     except Exception as e:
         await ctx.send(f"❌ No pude conectarme al canal: {str(e)}")
         return
