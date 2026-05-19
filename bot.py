@@ -8,6 +8,8 @@ import time
 from discord.ext import commands
 from discord.ext.voice_recv import VoiceRecvClient, BasicSink
 from dotenv import load_dotenv
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 load_dotenv()
 
@@ -252,6 +254,20 @@ async def on_voice_state_update(member, before, after):
         await session.text_channel.send("👋 Todos salieron del canal — deteniendo grabación.")
         await session.stop()
 
+# HTTP Mini server
+class HealthCheck(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # silenciar logs
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", 8080), HealthCheck)
+    server.serve_forever()
+
+threading.Thread(target=run_health_server, daemon=True).start()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
