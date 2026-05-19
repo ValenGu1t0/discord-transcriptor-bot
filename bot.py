@@ -269,6 +269,11 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
+@bot.event
+async def on_message(message):
+    print(f"Mensaje recibido: {message.content} de {message.author}")
+    await bot.process_commands(message)
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
