@@ -79,7 +79,7 @@ class RecordingSession:
         self.is_recording = True
 
         def audio_callback(user, data):
-            self.collector.add_chunk(bytes(data.data))
+            self.collector.add_chunk(bytes(data.pcm))
 
         sink = BasicSink(audio_callback)
         self.voice_client.listen(sink)
