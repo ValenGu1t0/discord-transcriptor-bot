@@ -208,6 +208,10 @@ class RecordingSession:
             for i, audio_segment in enumerate(self.segments):
                 try:
                     audio_segment.seek(0)
+
+                    # El audio va como multipart (binario 'audio');
+                    # la metadata va por query string para que n8n la reciba
+                    # en $json.query en lugar de como partes binarias.
                     form = aiohttp.FormData()
                     form.add_field(
                         'audio',
@@ -215,13 +219,17 @@ class RecordingSession:
                         filename=f'segment_{i+1}.wav',
                         content_type='audio/wav'
                     )
-                    form.add_field('segment', str(i + 1))
-                    form.add_field('total_segments', str(len(self.segments)))
-                    form.add_field('channel_id', str(self.channel.id))
-                    form.add_field('channel_name', self.channel.name)
-                    form.add_field('guild_id', str(self.channel.guild.id))
 
-                    async with session.post(N8N_WEBHOOK_URL, data=form, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                    params = {
+                        'segment': str(i + 1),
+                        'total_segments': str(len(self.segments)),
+                        'channel_id': str(self.channel.id),
+                        'channel_name': self.channel.name,
+                        'guild_id': str(self.channel.guild.id),
+                    }
+
+                    async with session.post(N8N_WEBHOOK_URL, data=form, params=params,
+                                            timeout=aiohttp.ClientTimeout(total=120)) as resp:
                         if resp.status == 200:
                             await self.text_channel.send(f"✅ Segmento {i+1}/{len(self.segments)} enviado a n8n.")
                         else:
