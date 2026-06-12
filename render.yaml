@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: discord-transcriptor
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: N8N_WEBHOOK_URL
+        sync: false

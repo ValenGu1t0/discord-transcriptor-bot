@@ -5,6 +5,7 @@ import os
 import io
 import wave
 import time
+import logging
 from discord.ext import commands
 from discord.ext.voice_recv import VoiceRecvClient, BasicSink
 from dotenv import load_dotenv
@@ -13,13 +14,36 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("transcriptor")
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 
 # Configuracion
-SILENCE_TIMEOUT = 30        # segundos de silencio antes de terminar
+SILENCE_TIMEOUT = 30        # segundos de silencio antes de terminar (despues de haber recibido audio)
+NO_AUDIO_TIMEOUT = 60       # segundos de gracia si NUNCA llego audio (problema tecnico)
 MAX_SEGMENT_DURATION = 540  # 9 minutos por segmento (margen antes de 25MB)
-CHUNK_SIZE = 3840           # bytes por chunk de audio (20ms a 48kHz stereo)
+
+# ── Carga de Opus ─────────────────────────────────────────────────────────────
+# discord-ext-voice-recv necesita libopus para decodificar los paquetes de voz.
+# Sin esto, el bot se conecta pero NUNCA recibe PCM (falla silenciosa).
+def ensure_opus():
+    if discord.opus.is_loaded():
+        return True
+    for lib in ("opus", "libopus.so.0", "libopus.0.dylib", "libopus-0.dll", "opus.dll"):
+        try:
+            discord.opus.load_opus(lib)
+            return True
+        except Exception:
+            continue
+    return False
+
+OPUS_OK = ensure_opus()
+log.info("Opus cargado: %s", OPUS_OK)
+if not OPUS_OK:
+    log.error("⚠️ libopus NO esta disponible. La captura de voz NO va a funcionar. "
+              "Instala libopus0 en el contenedor (ver Dockerfile).")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -74,15 +98,32 @@ class RecordingSession:
         self.start_time = time.time()
         self.segment_start_time = time.time()
         self.stopped_manually = False
+        self.packet_count = 0
+        self.received_any_audio = False
 
     async def start(self):
         self.is_recording = True
+        loop = asyncio.get_running_loop()
 
         def audio_callback(user, data):
-            self.collector.add_chunk(bytes(data.pcm))
+            # OJO: esto corre en el hilo de voz, no en el event loop.
+            try:
+                pcm = data.pcm  # ya es bytes
+                if not pcm:
+                    return
+                self.packet_count += 1
+                if self.packet_count == 1:
+                    self.received_any_audio = True
+                    log.info("🎧 Primer paquete de audio recibido (user=%s, %d bytes)", user, len(pcm))
+                elif self.packet_count % 500 == 0:  # ~cada 10s de audio
+                    log.info("🎧 %d paquetes acumulados", self.packet_count)
+                self.collector.add_chunk(pcm)
+            except Exception as e:
+                log.error("Error en audio_callback: %r — atributos de data: %s", e, dir(data))
 
         sink = BasicSink(audio_callback)
         self.voice_client.listen(sink)
+        log.info("Escuchando en canal '%s' (opus_loaded=%s)", self.channel.name, discord.opus.is_loaded())
 
         await self.text_channel.send("🔴 **Grabación iniciada.** Hablen con normalidad.\nUsá `!stop` para detener manualmente.")
         asyncio.create_task(self.monitor())
@@ -102,11 +143,26 @@ class RecordingSession:
                 await self.stop()
                 break
 
-            # Verificar silencio prolongado
-            if (time.time() - self.collector.last_audio_time) > SILENCE_TIMEOUT:
-                await self.text_channel.send(f"🔇 {SILENCE_TIMEOUT}s de silencio — deteniendo grabación.")
-                await self.stop()
-                break
+            elapsed_since_audio = time.time() - self.collector.last_audio_time
+
+            if not self.received_any_audio:
+                # Nunca llegó audio: probable problema técnico, damos más margen y avisamos distinto
+                if elapsed_since_audio > NO_AUDIO_TIMEOUT:
+                    await self.text_channel.send(
+                        f"⚠️ Pasaron {NO_AUDIO_TIMEOUT}s y **no se recibió ningún paquete de audio**. "
+                        "Esto suele indicar un problema de captura (¿libopus instalado en el servidor?). "
+                        "Deteniendo grabación."
+                    )
+                    log.error("No se recibió NINGÚN paquete de audio en %ds. opus_loaded=%s",
+                              NO_AUDIO_TIMEOUT, discord.opus.is_loaded())
+                    await self.stop()
+                    break
+            else:
+                # Ya hubo audio: silencio prolongado real
+                if elapsed_since_audio > SILENCE_TIMEOUT:
+                    await self.text_channel.send(f"🔇 {SILENCE_TIMEOUT}s de silencio — deteniendo grabación.")
+                    await self.stop()
+                    break
 
             # Verificar duración máxima del segmento
             if (time.time() - self.segment_start_time) > MAX_SEGMENT_DURATION:
@@ -130,7 +186,13 @@ class RecordingSession:
         if wav:
             self.segments.append(wav)
 
-        self.voice_client.stop_listening()
+        try:
+            self.voice_client.stop_listening()
+        except Exception as e:
+            log.warning("Error al detener listener: %r", e)
+
+        log.info("Grabación detenida. Paquetes totales: %d, segmentos: %d",
+                 self.packet_count, len(self.segments))
         await self.send_to_n8n()
 
     async def send_to_n8n(self):
@@ -182,7 +244,7 @@ class RecordingSession:
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot conectado como {bot.user}")
+    log.info("✅ Bot conectado como %s | opus_loaded=%s", bot.user, discord.opus.is_loaded())
 
 
 @bot.command(name="start")
@@ -194,6 +256,11 @@ async def start_recording(ctx):
 
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("❌ Tenés que estar en un canal de voz para usar este comando.")
+        return
+
+    if not discord.opus.is_loaded():
+        await ctx.send("❌ **libopus no está cargado en el servidor** — no puedo decodificar audio. "
+                       "Hay que instalar `libopus0` en el entorno de deploy.")
         return
 
     voice_channel = ctx.author.voice.channel
@@ -230,12 +297,15 @@ async def status(ctx):
         elapsed = int(time.time() - session.start_time)
         mins = elapsed // 60
         secs = elapsed % 60
-        await ctx.send(f"🔴 Grabación activa — {mins}m {secs}s transcurridos en **{session.channel.name}**")
+        await ctx.send(
+            f"🔴 Grabación activa — {mins}m {secs}s transcurridos en **{session.channel.name}** "
+            f"| paquetes de audio recibidos: {session.packet_count}"
+        )
     else:
         await ctx.send("⚪ No hay grabación activa.")
 
 
-# ── Auto-join cuando todos se van ─────────────────────────────────────────────
+# ── Auto-stop cuando todos se van ─────────────────────────────────────────────
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -264,14 +334,16 @@ class HealthCheck(BaseHTTPRequestHandler):
         pass  # silenciar logs
 
 def run_health_server():
-    server = HTTPServer(("0.0.0.0", 8080), HealthCheck)
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), HealthCheck)
     server.serve_forever()
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
 @bot.event
 async def on_message(message):
-    print(f"Mensaje recibido: {message.content} de {message.author}")
+    if not message.author.bot:
+        log.info("Mensaje recibido: %s de %s", message.content, message.author)
     await bot.process_commands(message)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
