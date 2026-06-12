@@ -8,6 +8,13 @@ import time
 import logging
 from discord.ext import commands
 from discord.ext.voice_recv import VoiceRecvClient, BasicSink
+
+# davey: bindings del protocolo DAVE (E2EE de voz de Discord).
+# Viene incluido con discord.py[voice] >= 2.7.
+try:
+    import davey
+except ImportError:
+    davey = None
 from dotenv import load_dotenv
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -31,6 +38,14 @@ MAX_SEGMENT_DURATION = 540  # 9 minutos por segmento (margen antes de 25MB)
 def ensure_opus():
     if discord.opus.is_loaded():
         return True
+    # Intentar la libreria incluida con discord.py (funciona en Windows)
+    try:
+        discord.opus._load_default()
+        if discord.opus.is_loaded():
+            return True
+    except Exception:
+        pass
+    # Fallback: buscar la libreria del sistema (Linux/Mac/Docker)
     for lib in ("opus", "libopus.so.0", "libopus.0.dylib", "libopus-0.dll", "opus.dll"):
         try:
             discord.opus.load_opus(lib)
@@ -40,7 +55,10 @@ def ensure_opus():
     return False
 
 OPUS_OK = ensure_opus()
-log.info("Opus cargado: %s", OPUS_OK)
+log.info("Opus cargado: %s | davey (DAVE/E2EE) disponible: %s", OPUS_OK, davey is not None)
+if davey is None:
+    log.warning("⚠️ El paquete 'davey' no está instalado. Si Discord activa E2EE en el canal, "
+                "el audio llegará cifrado y no se podrá decodificar. Instalá: pip install davey")
 if not OPUS_OK:
     log.error("⚠️ libopus NO esta disponible. La captura de voz NO va a funcionar. "
               "Instala libopus0 en el contenedor (ver Dockerfile).")
@@ -100,30 +118,74 @@ class RecordingSession:
         self.stopped_manually = False
         self.packet_count = 0
         self.received_any_audio = False
+        self.decoders = {}        # user_id -> discord.opus.Decoder (estado por hablante)
+        self.dropped_packets = 0  # paquetes descartados por corrupción puntual
 
     async def start(self):
         self.is_recording = True
-        loop = asyncio.get_running_loop()
+
+        # WORKAROUND DAVE (E2EE): discord.py 2.7.x negocia el protocolo DAVE,
+        # pero discord-ext-voice-recv (<= 0.5.2a179) intenta decodificar los
+        # paquetes sin quitar primero la capa E2EE -> "OpusError: corrupted
+        # stream" y el hilo del router muere. Solución: pedir los paquetes
+        # Opus crudos (decode=False), descifrar DAVE a mano y decodificar
+        # nosotros con un decoder por usuario.
+        # Ref: github.com/imayhaveborkedit/discord-ext-voice-recv/issues/53
 
         def audio_callback(user, data):
             # OJO: esto corre en el hilo de voz, no en el event loop.
             try:
-                pcm = data.pcm  # ya es bytes
+                if user is None:
+                    return  # paquete sin SSRC mapeado todavía
+
+                payload = data.opus  # opus crudo (posiblemente aún cifrado con DAVE)
+                if not payload:
+                    return
+                opus_payload = bytes(payload)
+
+                # 1) Quitar la capa E2EE (DAVE) si la sesión está activa
+                dave = getattr(self.voice_client._connection, 'dave_session', None)
+                if davey is not None and dave is not None and dave.ready:
+                    try:
+                        decrypted = dave.decrypt(user.id, davey.MediaType.audio, opus_payload)
+                        if decrypted:
+                            opus_payload = bytes(decrypted)
+                    except Exception:
+                        # El paquete puede no estar cifrado E2EE (transición);
+                        # se intenta decodificar tal cual.
+                        pass
+
+                # 2) Decodificar Opus -> PCM (decoder con estado, uno por usuario)
+                dec = self.decoders.get(user.id)
+                if dec is None:
+                    dec = self.decoders[user.id] = discord.opus.Decoder()
+                pcm = dec.decode(opus_payload, fec=False)
                 if not pcm:
                     return
+
                 self.packet_count += 1
                 if self.packet_count == 1:
                     self.received_any_audio = True
-                    log.info("🎧 Primer paquete de audio recibido (user=%s, %d bytes)", user, len(pcm))
+                    log.info("🎧 Primer paquete decodificado (user=%s, %d bytes PCM, dave=%s)",
+                             user, len(pcm), bool(dave and dave.ready))
                 elif self.packet_count % 500 == 0:  # ~cada 10s de audio
                     log.info("🎧 %d paquetes acumulados", self.packet_count)
                 self.collector.add_chunk(pcm)
-            except Exception as e:
-                log.error("Error en audio_callback: %r — atributos de data: %s", e, dir(data))
 
-        sink = BasicSink(audio_callback)
+            except discord.opus.OpusError as e:
+                # Paquete puntual corrupto: se descarta SIN matar la recepción
+                self.dropped_packets += 1
+                if self.dropped_packets in (1, 10, 100) or self.dropped_packets % 1000 == 0:
+                    log.warning("Paquete opus descartado (#%d): %r", self.dropped_packets, e)
+            except Exception as e:
+                log.error("Error en audio_callback: %r", e)
+
+        # decode=False => wants_opus: el router de voice_recv NO intenta
+        # decodificar (ahí estaba el crash) y nos entrega el payload crudo.
+        sink = BasicSink(audio_callback, decode=False)
         self.voice_client.listen(sink)
-        log.info("Escuchando en canal '%s' (opus_loaded=%s)", self.channel.name, discord.opus.is_loaded())
+        log.info("Escuchando en canal '%s' (opus_loaded=%s, davey=%s)",
+                 self.channel.name, discord.opus.is_loaded(), davey is not None)
 
         await self.text_channel.send("🔴 **Grabación iniciada.** Hablen con normalidad.\nUsá `!stop` para detener manualmente.")
         asyncio.create_task(self.monitor())

@@ -1,0 +1,245 @@
+{
+  "name": "(TEST) Valentino - Discord Transcript",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "discord-audio",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        3808,
+        1552
+      ],
+      "id": "b621e9d7-5128-4f4c-93fd-37235eb5631e",
+      "name": "Webhook - Reunion Trigger",
+      "webhookId": "8b96f89b-b299-4163-85bf-853d9dd37555"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $binary.audio ? 'si' : '' }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "name": "¿AUDIO?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        4048,
+        1552
+      ],
+      "id": "ab7cb4cc-0e55-40fe-b55f-5ab1a9df68d5"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/audio/transcriptions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "audio"
+            },
+            {
+              "name": "model",
+              "value": "whisper-large-v3-turbo"
+            },
+            {
+              "name": "language",
+              "value": "es"
+            },
+            {
+              "name": "response_format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4384,
+        1392
+      ],
+      "id": "fef8b8f8-e8ff-4a1c-b0bd-c0ec0e02e936",
+      "name": "Transcriptor Groq",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "52QGJgVtyOBvjInl",
+          "name": "[Test] Groq Whisper Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "console.log('Audio vacío o nulo. Query recibida:', JSON.stringify($input.item.json.query || {}));\nreturn [];"
+      },
+      "name": "Log - No Audio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4384,
+        1712
+      ],
+      "id": "ee6ed189-4ebf-4f81-9603-f272b33d46a6"
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        4656,
+        1632
+      ],
+      "id": "1e047150-ca77-4612-a564-a23cc80a25d1",
+      "name": "Groq Chat Model1",
+      "credentials": {
+        "groqApi": {
+          "id": "r9sq6Nuuq11pelze",
+          "name": "Groq Thiscord"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "guildId": {
+          "__rl": true,
+          "value": "=1161337461138538518",
+          "mode": "id"
+        },
+        "channelId": {
+          "__rl": true,
+          "value": "1161337461138538521",
+          "mode": "id"
+        },
+        "content": "=🎙️ **Transcripción de voz**\n📢 Canal: **{{ $('Webhook - Reunion Trigger').item.json.query.channel_name }}** — segmento {{ $('Webhook - Reunion Trigger').item.json.query.segment }}/{{ $('Webhook - Reunion Trigger').item.json.query.total_segments }}\n\n📝 **Transcripción:**\n{{ $('Transcriptor Groq').item.json.text }}\n\n🤖 **Análisis:**\n{{ $('AI Agent Tool').item.json.output }}",
+        "options": {}
+      },
+      "name": "Enviar Resumen al Canal",
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        5040,
+        1424
+      ],
+      "id": "0058aafd-d210-40ab-b427-134b51a0acfb",
+      "webhookId": "8f46b1ec-b7e8-4b14-acb9-92367096d320",
+      "credentials": {
+        "discordBotApi": {
+          "id": "su32KbYmpeAHjvs9",
+          "name": "Meeting Transcriptor Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.text }}",
+        "options": {
+          "systemMessage": "Eres un asistente que recibe transcripciones de conversaciones de Discord. Analiza el texto y entrega:\n\n- Un resumen conciso\n- Los puntos clave mencionados\n- Responde siempre en español."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.8,
+      "position": [
+        4656,
+        1424
+      ],
+      "id": "ed6bd60a-daee-4c8c-89f8-4f68b502d335",
+      "name": "AI Agent Tool"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Reunion Trigger": {
+      "main": [
+        [
+          {
+            "node": "¿AUDIO?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿AUDIO?": {
+      "main": [
+        [
+          {
+            "node": "Transcriptor Groq",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log - No Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcriptor Groq": {
+      "main": [
+        [
+          {
+            "node": "AI Agent Tool",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent Tool",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent Tool": {
+      "main": [
+        [
+          {
+            "node": "Enviar Resumen al Canal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "539816e3-76b8-4578-97e4-e57e85489473",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "9ff18f4d3c66b36b3fcfd7be3b3e7bb5a2eaf71cc2e313e21c556413856c9b34"
+  },
+  "id": "G7cMPDemlziXpYM1",
+  "tags": []
+}
