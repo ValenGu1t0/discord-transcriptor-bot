@@ -1,0 +1,192 @@
+{
+  "name": "(TOOL) Discord Transcriptor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "discord-audio",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        5344,
+        1904
+      ],
+      "id": "636c0f90-382a-4a63-9ef6-f17a08776881",
+      "name": "Webhook - Transcript",
+      "webhookId": "discord-audio-prod"
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        5568,
+        2080
+      ],
+      "id": "978ab7d6-8e5f-4ac3-bf55-f0f49b2639c8",
+      "name": "Groq Chat Model",
+      "credentials": {
+        "groqApi": {
+          "id": "r9sq6Nuuq11pelze",
+          "name": "Groq Thiscord"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.body.texto_completo }}",
+        "options": {
+          "systemMessage": "Recibís la transcripción de una reunión de Discord en formato diálogo, con el nombre de cada participante. Generá un análisis con: 1) un resumen ejecutivo conciso; 2) los puntos clave tratados; 3) las decisiones o tareas acordadas, indicando responsable si se menciona. Respondé siempre en español y en texto plano (sin markdown ni asteriscos), listo para guardar en una base de datos."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.8,
+      "position": [
+        5568,
+        1904
+      ],
+      "id": "1a6025ed-4a09-4faa-9f9b-979e2e2e06b5",
+      "name": "Resumen IA"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Datos originales del webhook + resumen de la IA (nodo anterior)\nconst wh = $('Webhook - Transcript').item.json;\nconst p = wh.body ?? wh;\nconst resumen = ($json.output || '').toString().trim();\n\nconst dialogo = Array.isArray(p.dialogo) ? p.dialogo : [];\nconst participantes = Array.isArray(p.participantes)\n  ? p.participantes.join(', ')\n  : (p.participantes || '');\n\n// Duración HH:MM:SS\nconst dur = Number(p.duracion_seg || 0);\nconst hh = String(Math.floor(dur / 3600)).padStart(2, '0');\nconst mm = String(Math.floor((dur % 3600) / 60)).padStart(2, '0');\nconst ss = String(dur % 60).padStart(2, '0');\nconst durStr = `${hh}:${mm}:${ss}`;\n\n// Fecha en hora de Argentina para el documento\nlet fechaLocal = p.fecha;\ntry {\n  fechaLocal = new Date(p.fecha).toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });\n} catch (e) {}\n\n// Diálogo en markdown\nconst dialogoMd = dialogo\n  .map(d => `**[${d.t}] ${d.hablante}:** ${d.texto}`)\n  .join('\\n\\n');\n\nconst md = `# ${p.titulo}\n\n- **Canal:** ${p.canal}\n- **Fecha:** ${fechaLocal}\n- **Duración:** ${durStr}\n- **Participantes:** ${participantes}\n\n## Resumen\n\n${resumen}\n\n## Transcripción\n\n${dialogoMd}\n`;\n\n// Nombre de archivo seguro (sin tildes ni símbolos)\nconst filename = (p.titulo || 'reunion').toString()\n  .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n  .replace(/[^a-zA-Z0-9-_ ]/g, '').trim()\n  .replace(/\\s+/g, '_').slice(0, 80) + '.md';\n\nconst file_base64 = Buffer.from(md, 'utf8').toString('base64');\n\n// Texto plano para el campo Transcripción\nconst textoCompleto = p.texto_completo\n  || dialogo.map(d => `[${d.t}] ${d.hablante}: ${d.texto}`).join('\\n');\n\n// Body para crear el registro en Airtable\nconst airtable_body = {\n  fields: {\n    \"Título\": p.titulo,\n    \"Fecha\": p.fecha,\n    \"Canal\": p.canal,\n    \"Participantes\": participantes,\n    \"Duración\": dur,\n    \"Resumen\": resumen,\n    \"Transcripción\": textoCompleto,\n    \"Estado\": \"Completo\"\n  },\n  typecast: true\n};\n\n// Body para subir el adjunto .md (la URL usa el id del registro recién creado)\nconst upload_body = {\n  contentType: \"text/markdown\",\n  filename: filename,\n  file: file_base64\n};\n\nreturn [{ json: { filename, airtable_body, upload_body } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5936,
+        1904
+      ],
+      "id": "a0bda854-7ea7-4a6d-9c89-1d8c5cd79516",
+      "name": "Armar MD"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.airtable.com/v0/app8220eXfZwYnRPO/tbl9tus6CSjatb2Ug",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.airtable_body }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6208,
+        1904
+      ],
+      "id": "2a14e9a9-78cd-4180-b74d-ede509fc6560",
+      "name": "Crear Registro Airtable",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "inKc1rMQv6QFX5FY",
+          "name": "n8n DS Transcriptor - Airtable"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://content.airtable.com/v0/app8220eXfZwYnRPO/{{ $json.id }}/Documento%20MD/uploadAttachment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Armar MD').item.json.upload_body }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6480,
+        1904
+      ],
+      "id": "537ed1ba-939e-45c4-ba08-2fff1aab90a9",
+      "name": "Subir MD a Airtable",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "inKc1rMQv6QFX5FY",
+          "name": "n8n DS Transcriptor - Airtable"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Transcript": {
+      "main": [
+        [
+          {
+            "node": "Resumen IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Resumen IA",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resumen IA": {
+      "main": [
+        [
+          {
+            "node": "Armar MD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Armar MD": {
+      "main": [
+        [
+          {
+            "node": "Crear Registro Airtable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crear Registro Airtable": {
+      "main": [
+        [
+          {
+            "node": "Subir MD a Airtable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5de3ce47-9456-4861-bb23-31e02090d97b",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "9ff18f4d3c66b36b3fcfd7be3b3e7bb5a2eaf71cc2e313e21c556413856c9b34"
+  },
+  "id": "G7cMPDemlziXpYM1",
+  "tags": []
+}
