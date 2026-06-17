@@ -9,3 +9,5 @@ services:
         sync: false
       - key: N8N_WEBHOOK_URL
         sync: false
+      - key: GROQ_API_KEY
+        sync: false
