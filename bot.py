@@ -37,17 +37,29 @@ log = logging.getLogger("transcriptor")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Transcripción: configurable. Por defecto OpenAI gpt-4o-transcribe.
+# Para volver a Groq: TRANSCRIBE_BASE_URL=https://api.groq.com/openai/v1
+#                     TRANSCRIBE_MODEL=whisper-large-v3-turbo
+TRANSCRIBE_BASE_URL = os.getenv("TRANSCRIBE_BASE_URL", "https://api.openai.com/v1")
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+TRANSCRIBE_API_KEY = os.getenv("TRANSCRIBE_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")
+TRANSCRIBE_LANGUAGE = os.getenv("TRANSCRIBE_LANGUAGE", "es")
+# Prompt opcional para mejorar nombres propios / jerga del dominio (ver notas).
+TRANSCRIBE_PROMPT = os.getenv("TRANSCRIBE_PROMPT", "")
+TRANSCRIBE_URL = f"{TRANSCRIBE_BASE_URL.rstrip('/')}/audio/transcriptions"
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 SILENCE_TIMEOUT = 30          # seg de silencio antes de terminar (tras haber recibido audio)
 NO_AUDIO_TIMEOUT = 60         # seg de gracia si NUNCA llegó audio (problema técnico)
 
 # Segmentación por hablante / utterances
-UTTERANCE_GAP = 1.0           # seg de silencio de un mismo hablante => cierra su intervención
-MAX_UTTERANCE_DURATION = 30.0 # corta intervenciones muy largas (mejor para Whisper y memoria)
-MIN_UTTERANCE_DURATION = 0.4  # descarta clips demasiado cortos (ruido, "ajá", clics)
-FLUSH_INTERVAL = 300          # cada 5 min transcribe lo acumulado y libera el audio (escala a reuniones largas)
+# Gap más alto => intervenciones más largas y con contexto: mejor transcripción,
+# menos alucinaciones y menos llamadas a la API.
+UTTERANCE_GAP = 1.5           # seg de silencio de un mismo hablante => cierra su intervención
+MAX_UTTERANCE_DURATION = 30.0 # corta intervenciones muy largas
+MIN_UTTERANCE_DURATION = 0.6  # descarta clips muy cortos (ruido, "ajá") que disparan alucinaciones
+FLUSH_INTERVAL = 300          # cada 5 min transcribe lo acumulado y libera el audio
 
 # Audio crudo de Discord
 SAMPLE_RATE = 48000
@@ -55,11 +67,20 @@ CHANNELS = 2
 SAMPLE_WIDTH = 2              # 16-bit
 BYTES_PER_SEC = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH
 
-# Groq Whisper
-GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-WHISPER_MODEL = "whisper-large-v3-turbo"
-WHISPER_LANG = "es"
-WHISPER_CONCURRENCY = 4       # llamadas simultáneas a Groq (cuidando rate limits)
+# Transcripción
+WHISPER_CONCURRENCY = 4       # llamadas simultáneas a la API (cuidando rate limits)
+TRANSCRIBE_MAX_RETRIES = 3
+TRANSCRIBE_TIMEOUT = 90
+
+# Frases que los modelos STT suelen alucinar sobre silencio/ruido. Si el output
+# ES EXACTAMENTE una de estas, se descarta. Ajustá la lista según tu caso.
+HALLUCINATION_BLOCKLIST = {
+    "gracias.", "gracias", "muchas gracias.", "muchas gracias",
+    "gracias por ver el video", "gracias por ver el video.",
+    "¡gracias por ver el video!", "subtítulos realizados por la comunidad de amara.org",
+    "subtítulos por la comunidad de amara.org", "subtítulos en español de amara.org",
+    "¡suscríbete!", "¡suscríbete al canal!",
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONTRATO con n8n (lo que manda este bot al webhook, como JSON):
@@ -110,9 +131,10 @@ if davey is None:
 if not OPUS_OK:
     log.error("⚠️ libopus NO está disponible. La captura de voz NO va a funcionar. "
               "Instalá libopus0 en el contenedor (ver Dockerfile).")
-if not GROQ_API_KEY:
-    log.warning("⚠️ GROQ_API_KEY no está seteada. La transcripción va a fallar. "
-                "Agregala como variable de entorno.")
+if not TRANSCRIBE_API_KEY:
+    log.warning("⚠️ No hay API key de transcripción (TRANSCRIBE_API_KEY / OPENAI_API_KEY). "
+                "La transcripción va a fallar. Agregala como variable de entorno.")
+log.info("Transcripción: modelo=%s endpoint=%s", TRANSCRIBE_MODEL, TRANSCRIBE_URL)
 
 
 # ── Utilidades de audio ───────────────────────────────────────────────────────
@@ -140,6 +162,18 @@ def pcm_to_wav_mono(pcm: bytes) -> io.BytesIO:
 def fmt_ts(seconds: float) -> str:
     s = int(seconds)
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def looks_like_hallucination(text: str) -> bool:
+    """Detecta salidas típicas de alucinación de los modelos STT sobre silencio/ruido."""
+    t = text.strip().lower()
+    if t in HALLUCINATION_BLOCKLIST or t.strip(" .!¡¿?") in HALLUCINATION_BLOCKLIST:
+        return True
+    words = t.strip(" .!¡¿?,").split()
+    # Repetición degenerada (ej. "éxito, éxito, éxito, éxito...")
+    if len(words) >= 4 and len(set(words)) <= 2:
+        return True
+    return False
 
 
 # ── Stream por hablante ───────────────────────────────────────────────────────
@@ -325,33 +359,39 @@ class RecordingSession:
 
         wav = pcm_to_wav_mono(pcm)
         async with sem:
-            for attempt in range(2):
+            for attempt in range(TRANSCRIBE_MAX_RETRIES):
                 try:
                     wav.seek(0)
                     form = aiohttp.FormData()
                     form.add_field("file", wav, filename="utt.wav", content_type="audio/wav")
-                    form.add_field("model", WHISPER_MODEL)
-                    form.add_field("language", WHISPER_LANG)
+                    form.add_field("model", TRANSCRIBE_MODEL)
+                    if TRANSCRIBE_LANGUAGE:
+                        form.add_field("language", TRANSCRIBE_LANGUAGE)
                     form.add_field("response_format", "json")
-                    form.add_field("temperature", "0")
+                    if TRANSCRIBE_PROMPT:
+                        form.add_field("prompt", TRANSCRIBE_PROMPT)
                     async with session.post(
-                        GROQ_TRANSCRIBE_URL,
+                        TRANSCRIBE_URL,
                         data=form,
-                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                        timeout=aiohttp.ClientTimeout(total=90),
+                        headers={"Authorization": f"Bearer {TRANSCRIBE_API_KEY}"},
+                        timeout=aiohttp.ClientTimeout(total=TRANSCRIBE_TIMEOUT),
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             text = (data.get("text") or "").strip()
-                            if not text:
+                            if not text or looks_like_hallucination(text):
                                 return None
                             return {"start": utt["start"], "speaker": utt["speaker"], "text": text}
                         body = await resp.text()
-                        log.warning("Whisper HTTP %s: %s", resp.status, body[:200])
+                        log.warning("Transcribe HTTP %s (intento %d): %s", resp.status, attempt + 1, body[:200])
+                        # Errores no recuperables (auth, request inválida): no reintentar.
+                        if resp.status not in (429, 500, 502, 503, 504):
+                            break
                 except Exception as e:
-                    log.warning("Whisper error (intento %d): %r", attempt + 1, e)
-                await asyncio.sleep(1.0)
-        # Falló tras reintentos: dejamos marca para no perder el hueco.
+                    log.warning("Transcribe error (intento %d): %r", attempt + 1, e)
+                # Backoff exponencial (clave para 429 y picos de red).
+                await asyncio.sleep(min(1.5 * (2 ** attempt), 8))
+        # Falló tras reintentos: marca para no perder el hueco.
         return {"start": utt["start"], "speaker": utt["speaker"], "text": "[inaudible]"}
 
     async def flush(self, final: bool = False) -> int:
@@ -533,8 +573,8 @@ async def start_recording(ctx, *, nombre: str = None):
         await ctx.send("❌ **libopus no está cargado** — no puedo decodificar audio.")
         return
 
-    if not GROQ_API_KEY:
-        await ctx.send("❌ Falta **GROQ_API_KEY** en el entorno — no puedo transcribir.")
+    if not TRANSCRIBE_API_KEY:
+        await ctx.send("❌ Falta la **API key de transcripción** en el entorno — no puedo transcribir.")
         return
 
     voice_channel = ctx.author.voice.channel
