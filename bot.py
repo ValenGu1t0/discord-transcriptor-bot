@@ -3,10 +3,12 @@ import asyncio
 import aiohttp
 import os
 import io
+import json
 import wave
 import time
 import queue
 import logging
+import unicodedata
 from datetime import datetime, timezone
 from discord.ext import commands
 from discord.ext.voice_recv import VoiceRecvClient, BasicSink
@@ -71,6 +73,41 @@ BYTES_PER_SEC = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH
 WHISPER_CONCURRENCY = 4       # llamadas simultáneas a la API (cuidando rate limits)
 TRANSCRIBE_MAX_RETRIES = 3
 TRANSCRIBE_TIMEOUT = 90
+DROP_NON_LATIN_SCRIPTS = True  # descarta salidas en chino/griego/cirílico/etc. (alucinaciones en una reunión en español)
+
+# Envío a n8n: reintentos + fallback a archivo local (que no se pierda ninguna reunión)
+N8N_MAX_RETRIES = 5
+FAILED_PAYLOAD_DIR = os.getenv("FAILED_PAYLOAD_DIR", "failed_payloads")
+
+# Filtro de idioma: descarta intervenciones CORTAS detectadas en otro idioma
+# (alucinaciones tipo "Hello", "Nein", "coffee"). Las frases largas NO se filtran,
+# para preservar el spanglish técnico ("deploy el ticket en la branch").
+LANG_FILTER_ENABLED = os.getenv("LANG_FILTER", "1").lower() not in ("0", "false", "no")
+SHORT_UTTERANCE_MAX_WORDS = 2
+SPANISH_SHORT_ALLOWLIST = {
+    "si", "sí", "no", "dale", "ok", "oka", "okay", "okey", "listo", "lista", "claro",
+    "bien", "bueno", "buena", "buenas", "hola", "chau", "hmm", "mmm", "mm", "ajá", "aja",
+    "ah", "eh", "ehh", "em", "este", "exacto", "exacta", "perfecto", "perfecta",
+    "bárbaro", "barbaro", "obvio", "obvia", "joya", "genial", "correcto", "cierto",
+    "posta", "nada", "eso", "ya", "vale", "igual", "capaz", "seguro", "tal cual",
+    "o sea", "de una",
+}
+
+_lang_detector = None
+_LANG_ES = None
+if LANG_FILTER_ENABLED:
+    try:
+        from lingua import Language, LanguageDetectorBuilder
+        _LANG_ES = Language.SPANISH
+        _lang_detector = LanguageDetectorBuilder.from_languages(
+            Language.SPANISH, Language.ENGLISH, Language.GERMAN,
+            Language.FRENCH, Language.ITALIAN, Language.PORTUGUESE,
+        ).build()
+        log.info("Filtro de idioma activo (lingua): se descartan clips cortos en otros idiomas.")
+    except Exception as e:
+        log.warning("lingua no disponible — filtro de idioma OFF "
+                    "(pip install lingua-language-detector). Detalle: %r", e)
+        _lang_detector = None
 
 # Frases que los modelos STT suelen alucinar sobre silencio/ruido. Si el output
 # ES EXACTAMENTE una de estas, se descarta. Ajustá la lista según tu caso.
@@ -174,6 +211,33 @@ def looks_like_hallucination(text: str) -> bool:
     if len(words) >= 4 and len(set(words)) <= 2:
         return True
     return False
+
+
+def has_non_latin_script(text: str, threshold: float = 0.3) -> bool:
+    """True si una porción significativa de las letras NO es latina (chino, griego,
+    cirílico, árabe, etc.). En una reunión en español eso es casi siempre alucinación."""
+    non_latin = 0
+    letters = 0
+    for ch in text:
+        if ch.isalpha():
+            letters += 1
+            if not unicodedata.name(ch, "").startswith("LATIN"):
+                non_latin += 1
+    return letters > 0 and (non_latin / letters) > threshold
+
+
+def is_foreign_short_utterance(text: str) -> bool:
+    """True si es una intervención corta (<= SHORT_UTTERANCE_MAX_WORDS) detectada en un
+    idioma que no es español. Las frases largas se conservan siempre (preserva el spanglish)."""
+    if _lang_detector is None:
+        return False
+    if len(text.split()) > SHORT_UTTERANCE_MAX_WORDS:
+        return False
+    norm = text.strip().lower().strip(" .!¡¿?,;:")
+    if norm in SPANISH_SHORT_ALLOWLIST:
+        return False
+    lang = _lang_detector.detect_language_of(text)
+    return lang is not None and lang != _LANG_ES
 
 
 # ── Stream por hablante ───────────────────────────────────────────────────────
@@ -381,6 +445,12 @@ class RecordingSession:
                             text = (data.get("text") or "").strip()
                             if not text or looks_like_hallucination(text):
                                 return None
+                            if DROP_NON_LATIN_SCRIPTS and has_non_latin_script(text):
+                                log.info("Descartado (script no-latino, prob. alucinación): %r", text)
+                                return None
+                            if is_foreign_short_utterance(text):
+                                log.info("Descartado (idioma extranjero en clip corto): %r", text)
+                                return None
                             return {"start": utt["start"], "speaker": utt["speaker"], "text": text}
                         body = await resp.text()
                         log.warning("Transcribe HTTP %s (intento %d): %s", resp.status, attempt + 1, body[:200])
@@ -512,26 +582,59 @@ class RecordingSession:
         log.info("Payload a n8n (%d intervenciones, %d participantes):\n%s",
                  len(payload["dialogo"]), len(payload["participantes"]), preview)
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    N8N_WEBHOOK_URL, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    if resp.status == 200:
-                        await self.text_channel.send(
-                            f"✅ Enviado a n8n — **{len(payload['dialogo'])} intervenciones** de "
-                            f"**{', '.join(payload['participantes'])}**."
-                        )
-                    else:
+        sent = False
+        last_error = None
+        for attempt in range(N8N_MAX_RETRIES):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        N8N_WEBHOOK_URL, json=payload,
+                        timeout=aiohttp.ClientTimeout(total=120),
+                    ) as resp:
+                        if resp.status == 200:
+                            sent = True
+                            await self.text_channel.send(
+                                f"✅ Enviado a n8n — **{len(payload['dialogo'])} intervenciones** de "
+                                f"**{', '.join(payload['participantes'])}**."
+                            )
+                            break
                         body = await resp.text()
-                        await self.text_channel.send(f"❌ n8n respondió HTTP {resp.status}.")
-                        log.warning("n8n HTTP %s: %s", resp.status, body[:300])
-        except Exception as e:
-            await self.text_channel.send(f"❌ Error enviando a n8n: {e}")
-            log.error("Error enviando a n8n: %r", e)
+                        last_error = f"HTTP {resp.status}: {body[:200]}"
+                        log.warning("n8n %s (intento %d/%d)", last_error, attempt + 1, N8N_MAX_RETRIES)
+                        # 4xx (config/ruta mal) no se arregla reintentando: cortamos.
+                        if 400 <= resp.status < 500:
+                            break
+            except Exception as e:
+                last_error = repr(e)
+                log.warning("Error enviando a n8n (intento %d/%d): %s", attempt + 1, N8N_MAX_RETRIES, last_error)
+            # Backoff exponencial: aguanta cold-starts / reinicios de n8n.
+            if attempt < N8N_MAX_RETRIES - 1:
+                await asyncio.sleep(min(3 * (2 ** attempt), 30))
+
+        if not sent:
+            path = self._save_failed_payload(payload)
+            await self.text_channel.send(
+                f"⚠️ No pude enviar a n8n ({last_error}).\n"
+                f"**La transcripción NO se perdió** — la guardé localmente para reenviarla:\n`{path}`"
+            )
+            log.error("n8n inaccesible tras %d intentos. Payload guardado en %s", N8N_MAX_RETRIES, path)
 
         await self.cleanup()
+
+    def _save_failed_payload(self, payload: dict) -> str:
+        """Guarda el payload en disco para no perder la reunión si n8n está caído."""
+        try:
+            os.makedirs(FAILED_PAYLOAD_DIR, exist_ok=True)
+            safe = "".join(c for c in payload.get("titulo", "reunion")
+                           if c.isalnum() or c in " -_").strip().replace(" ", "_")
+            fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe[:60] or 'reunion'}.json"
+            path = os.path.join(FAILED_PAYLOAD_DIR, fname)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            return path
+        except Exception as e:
+            log.error("No se pudo guardar el payload fallido: %r", e)
+            return "(no se pudo guardar)"
 
     async def cleanup(self):
         guild_id = self.channel.guild.id

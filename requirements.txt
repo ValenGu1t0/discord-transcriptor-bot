@@ -5,3 +5,4 @@ aiohttp
 pynacl
 python-dotenv
 requests
+lingua-language-detector
