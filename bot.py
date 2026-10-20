@@ -83,7 +83,7 @@ FAILED_PAYLOAD_DIR = os.getenv("FAILED_PAYLOAD_DIR", "failed_payloads")
 # (alucinaciones tipo "Hello", "Nein", "coffee"). Las frases largas NO se filtran,
 # para preservar el spanglish técnico ("deploy el ticket en la branch").
 LANG_FILTER_ENABLED = os.getenv("LANG_FILTER", "1").lower() not in ("0", "false", "no")
-SHORT_UTTERANCE_MAX_WORDS = 2
+SHORT_UTTERANCE_MAX_WORDS = int(os.getenv("SHORT_UTTERANCE_MAX_WORDS", "2"))
 SPANISH_SHORT_ALLOWLIST = {
     "si", "sí", "no", "dale", "ok", "oka", "okay", "okey", "listo", "lista", "claro",
     "bien", "bueno", "buena", "buenas", "hola", "chau", "hmm", "mmm", "mm", "ajá", "aja",
@@ -92,6 +92,9 @@ SPANISH_SHORT_ALLOWLIST = {
     "posta", "nada", "eso", "ya", "vale", "igual", "capaz", "seguro", "tal cual",
     "o sea", "de una",
 }
+_extra_allow = os.getenv("SPANISH_EXTRA_ALLOWLIST", "")
+if _extra_allow:
+    SPANISH_SHORT_ALLOWLIST |= {w.strip().lower() for w in _extra_allow.split(",") if w.strip()}
 
 _lang_detector = None
 _LANG_ES = None
@@ -134,8 +137,8 @@ HALLUCINATION_BLOCKLIST = {
 #   "texto_completo": str            # el diálogo ya formateado como texto plano
 # }
 #
-# n8n lo recibe en $json.body. (Fase 2: armar el .md, resumir con Llama y
-# guardar en Airtable.)
+# n8n lo recibe en $json.body, genera el resumen con un LLM, arma el .md y
+# publica el resultado en el canal de Discord.
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -737,7 +740,7 @@ async def on_voice_state_update(member, before, after):
         await session.stop()
 
 
-# ── HTTP mini server (health check para Render) ───────────────────────────────
+# ── HTTP mini server (health check) ───────────────────────────────────────────
 class HealthCheck(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
