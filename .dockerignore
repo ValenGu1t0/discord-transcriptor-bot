@@ -1,0 +1,11 @@
+.env
+docs/
+.git/
+.venv/
+failed_payloads/
+__pycache__/
+*.py[cod]
+*.ogg
+*.wav
+*.mp3
+recordings/

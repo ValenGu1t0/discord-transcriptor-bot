@@ -1,0 +1,9 @@
+services:
+  discord-transcriptor:
+    build: .
+    container_name: discord-transcriptor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./failed_payloads:/app/failed_payloads
