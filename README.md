@@ -1,8 +1,12 @@
 # Discord Meeting Transcriptor
 
-Bot de Discord que se une a un canal de voz, escucha a cada participante por separado, transcribe la reunión **con el nombre de quien habla**, genera un resumen con IA y publica el resultado en un canal de texto de Discord.
+El siguiente repositorio contiene la instalación y configuración de un bot para **Discord** que se puede invocar en un canal de voz, y permite escuchar a cada participante por separado,**identificar quien habla** y transcribir la reunión completa. Además, genera un resumen de lo charlado con un LLM y publica el resultado en un canal de texto a elección de Discord.
+
+Para desarrollarlo utilicé un script de python en conjunto con un workflow de n8n + LLMs diversos como el *gpt-4o-transcribe* de OpenAI para la escucha o uno gratuito de Groq para el resumen.
 
 > ⚠️ **Antes de usarlo:** grabar la voz de personas requiere su consentimiento. Ver [Privacidad](#privacidad-y-consentimiento).
+
+A continuación se detalla como instalarlo y configurarlo: 
 
 ---
 
@@ -57,7 +61,7 @@ El bot **no mezcla** las pistas de audio: como Discord entrega cada voz con su i
 ## 2. Instalación
 
 ```bash
-git clone https://github.com/TU_USUARIO/discord-transcriptor-bot.git
+git clone https://github.com/ValenGu1t0/discord-transcriptor-bot.git
 cd discord-transcriptor-bot
 cp .env.example .env     # completá las variables (ver tabla abajo)
 ```
